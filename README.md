@@ -49,7 +49,7 @@ To set up the project environment, follow these steps:
 
 sh
 Copy code
-git clone https://github.com/your-username/bev-adoption-forecast.git
+git clone [https://github.com/your-username/bev-adoption-forecast.git](https://github.com/MarkStephens060482/forecasting_BEV_adoption_LGA/edit/main/README.md)
 cd bev-adoption-forecast
 Install the required packages:
 
