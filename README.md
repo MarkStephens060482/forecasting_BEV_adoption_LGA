@@ -36,10 +36,15 @@ Economic indicators and household characteristics
 
 ### Methodology
 Data Collection: Gather data from relevant sources using defined keywords and search strategies [Goto file](https://github.com/MarkStephens060482/forecasting_BEV_adoption_LGA/blob/main/Uptake_of_Electric_Vehicles_Collating_and_Cleaning.ipynb)
+
 Data Preprocessing: Clean and preprocess data for analysis, ensuring compatibility and completeness.
+
 Feature Engineering: Identify and create relevant features influencing BEV adoption.
+
 Model Development: Develop and train machine learning models, including tree-based algorithms like XGBoost.
-Model Evaluation: Evaluate model performance using metrics such as Mean Absolute Percentage Error (MAPE).
+
+Model Evaluation: Evaluate model performance using metrics such as Symetric Mean Absolute Percentage Error (SMAPE).
+
 Explainability: Ensure the model's predictions are explainable to support decision-making.
 
 ### Installation
