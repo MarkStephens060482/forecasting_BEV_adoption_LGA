@@ -35,7 +35,7 @@ Environmental awareness proxies such as voting patterns
 Economic indicators and household characteristics
 
 ### Methodology
-Data Collection: Gather data from relevant sources using defined keywords and search strategies.
+Data Collection: Gather data from relevant sources using defined keywords and search strategies [Goto file](https://github.com/MarkStephens060482/forecasting_BEV_adoption_LGA/blob/main/Uptake_of_Electric_Vehicles_Collating_and_Cleaning.ipynb)
 Data Preprocessing: Clean and preprocess data for analysis, ensuring compatibility and completeness.
 Feature Engineering: Identify and create relevant features influencing BEV adoption.
 Model Development: Develop and train machine learning models, including tree-based algorithms like XGBoost.
