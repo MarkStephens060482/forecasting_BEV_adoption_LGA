@@ -1,0 +1,2033 @@
+---
+title: "BEV Adoption - Multiple Imputation and Cluster Analysis"
+author: "Mark Stephens"
+date: "2024-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Set the root directory for all chunks
+knitr::opts_knit$set(root.dir = "C:/Users/Mark Stephens/Documents/Masters Data Science work/Capstone project/Data")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r load packages echo=T}
+pacman::p_load(dplyr, stringr,tidyverse, tidymodels,caret, future, ggplot2,mlim,janitor,stargazer,mice,cli,crayon,ucminf,nloptr,lme4,performance,devtools,reticulate,furrr,progressr,
+               RCurl,jsonlite,kml3d,zoo,clusterMI,fdasrvf,timetk,xgboost,kknn,hardhat,themis,h2o,agua,reshape2)
+# Download and install the H2O package for R
+
+```
+## Load data
+```{r working directory}
+Analysis_data <- read.csv("Analysis_df.csv")
+Auxiliary_data <- read.csv("et_imputed_Auxiliary.csv")
+# load R data file 
+
+# Set dataframes
+Analysis_data <- as.data.frame(Analysis_data)
+Auxiliary_data <- as.data.frame(Auxiliary_data)
+
+# Import the pickle module from Python
+selected_Aux_var <- py_run_string("
+import pickle
+with open('selected_Aux_vars.pickle', 'rb') as file:
+  data = pickle.load(file)")
+
+#  Load pickled Auxiliary selected features
+selected_Aux_var <- py$data
+#print( selected_Aux_var)
+# Finally, let's load H2O and start up an H2O cluster
+#library(h2o)
+head(Auxiliary_data)
+head(Analysis_data)
+```
+# Further Data Cleaning
+
+```{r Data Cleaning Analysis Data}
+# Janitor 
+# Clean names
+Analysis_data <-
+Analysis_data %>% clean_names()
+
+Auxiliary_data <-
+  Auxiliary_data %>% clean_names()
+
+selected_Aux_var <-
+  tolower(selected_Aux_var)
+
+#rename region
+Auxiliary_data <-
+Auxiliary_data %>%
+  rename(region = electoral_rating)
+
+#redefine Auxiliary dataset
+Auxiliary_data <-
+Auxiliary_data %>% select(-c(official_name_state:log_distance_capital))
+
+
+#set region as factor
+Auxiliary_data <-
+Auxiliary_data %>% mutate(across(c(region), factor))
+
+# collect lga_code and lga_name
+lgas <- 
+  Analysis_data %>% select(lga_code, lga_name)
+
+# drop lga_name, rooftop_solar, "households", "businesses"
+Analysis_data <-
+Analysis_data %>% 
+  select(-c("lga_name")) %>%
+  rename(state = official_name_state)
+
+# Transform variable
+Analysis_data <-
+  Analysis_data %>%
+  mutate(log_distance_capital = log(distance_capital))
+
+# make greens_vote_prop as percentage
+Analysis_data <- 
+  Analysis_data %>% mutate(greens_vote_prop = greens_vote_prop*100)
+
+# Remove a column
+Analysis_data <-
+Analysis_data %>% select(-distance_capital)
+
+#set state as factor
+Analysis_data <-
+Analysis_data %>% mutate(across(c(state), factor))
+
+#Set numeric columns to float
+Analysis_data <- 
+Analysis_data %>%
+  mutate(across(c(higher_education,high_income:log_distance_capital),~ as.numeric(.x)))
+
+# Define the first differencein EV_proportion
+#Analysis_data <- 
+#Analysis_data %>%
+#  mutate(across(c(rooftop_solar,households,businesses),~ as.integer(as.numeric(.x))))
+
+# move Target variable to end
+Analysis_data <-
+  Analysis_data %>%
+  select(-ev_prop,ev_prop)
+```
+
+## Transform Target Variable
+1. From the transformations identified in Exploratory data analysis,  the first difference of the log transformation de-trends the Target variable and gives the most linear relationship.
+```{r Target variable Transformation}
+# Function to calculate half the second smallest value
+half_second_smallest <- function(x) {
+  unique_vals <- sort(unique(x))
+  if (length(unique_vals) < 2) {
+    return(0) # Handle cases where there are not enough unique values
+  } else {
+    return(unique_vals[2] / 2)
+  }
+}    
+ev_prop_shift <- half_second_smallest(Analysis_data$ev_prop)
+#Analysis_data <- Analysis_data %>% 
+#  group_by(lga_code) %>%
+#  mutate(ev_prop_log = log(ev_prop + ev_prop_shift),
+#         ev_prop_log_diff = c(0, diff(ev_prop_log) )) %>%
+#  ungroup() %>%
+#  select(-ev_prop_log)
+```
+
+## Data Segregation
+Split the data into Train and Test Set based on downstream analysis forecast requirements.
+```{r Data Segregation}
+# Available data period
+start_year <- min(unique(Analysis_data$year))
+end_year <- max(unique(Analysis_data$year))
+
+# Minimum number of years for the test data set period
+test_min_years <- 5
+ 
+# Calculate the latest year for the training data to ensure at least minimum allowable period in the test set
+train_last_year <- end_year - test_min_years
+
+# Split the data based on boolean vector
+train_test_split <- Analysis_data$year <= train_last_year
+training <- Analysis_data[train_test_split,]
+testing <- Analysis_data[!train_test_split,]
+# separate predictors and target variable
+X_train <- training %>% select(-ev_prop)
+y_train <- training%>% select(ev_prop)
+X_test <- testing %>% select(-ev_prop)
+y_test <- testing%>% select(ev_prop)
+
+# Check the split years
+print(paste("Training data includes years up to:", train_last_year))
+print(paste("Dimensions of the training set is: ",sum(train_test_split)," by ",ncol(Analysis_data)))
+print(paste("Dimensions of the test set is: ",sum(!train_test_split)," by ",ncol(Analysis_data)))
+```
+
+# Combine the Training data with the Auxiliary variable set
+```{r merge training set and Auxiliary set}
+
+# Combine the main training data with the auxiliary data - full variable set
+data_combined <- merge(Analysis_data, Auxiliary_data, by = c("lga_code","year"), all.x = TRUE)
+print(paste("dimensions of combined data set 1: ", nrow(data_combined)," by ",ncol(data_combined)))
+
+#####Quickpred - 40 imputation model
+# select variables from Auxiliary dataset from quickpred - 40
+
+training_combined <- merge(X_train, Auxiliary_data[,c('lga_code','year',selected_Aux_var,'region')], by = c("lga_code","year"), all.x = TRUE)
+print(paste("dimensions of combined training data set 2: ", nrow(training_combined)," by ",ncol(training_combined)))
+
+testing_combined <- merge(X_test, Auxiliary_data[,c('lga_code','year',selected_Aux_var,'region')], by = c("lga_code","year"), all.x = TRUE)
+print(paste("dimensions of combined training data set 2: ", nrow(testing_combined)," by ",ncol(testing_combined)))
+```
+### Random effect in years 
+Examine intaclass correlation coefficient to see if random effects in Year accounts for observed variability. Year to year changes and unmeasured effects such as policy changes, economic conditions and natural disasters and events (pandemic)  effect variables.
+
+```{r icc}
+# missing value columns
+missing_value_cols <- 
+  c("higher_education",
+    "population_density",
+    "high_income",
+    "tech_affinity",
+    "greens_vote_prop")
+
+icc_values <- list()
+# Loop through each variable to fit the model and calculate ICC
+for (var in missing_value_cols) {
+  # Filter out missing values
+  data_filtered <- Analysis_data[!is.na(Analysis_data[[var]]), ]
+  # Check if the filtered data still has more than one level for the grouping factor 'year'
+  if (length(unique(data_filtered$year)) > 1) {
+  
+    formula <- as.formula(paste(var, "~ 1 + (1 | year)"))
+    model <- lmer(formula, data = data_filtered)
+    
+    # Check for singularity
+    if (isSingular(model, tol = 1e-4)) {
+      icc_values[[var]] <- NA  # Mark as NA if model is singular
+      warning(paste("Model for", var, "is singular. Consider simplifying the random effects structure."))
+      
+    } else {
+      icc_values[[var]] <- icc(model)
+    }
+  } else {
+    icc_values[[var]] <- NA  # Not enough levels in grouping factor after filtering
+  }
+}
+
+# Print ICC values
+print(icc_values)
+```
+High Income and rooftop solar have a moderate  ICC, suggesting a non-negligible portion of their variance  is due to differences between years. Including year as a random effect can help model this variability more accurately.
+
+### Perform MUltiple Imputation using MICE
+The Auxiliary variables are combined with Analysis Variables and the d 
+```{r Initialise multiple imputation for cluster analysis}
+# Use a local seed
+withr::local_seed(1L)
+# Use {progress} package for progress bar - shows diagnostics in real time
+handlers("txtprogressbar")
+# Correct Column names
+training_combined <-
+  training_combined %>% clean_names()
+# cluster id must be of type integer
+training_combined$lga_code <- as.integer(training_combined$lga_code)
+
+# Calculate the proportion of missing values in analysis feature set
+total_elements <- prod(dim(Analysis_data ))  # Total number of elements in the data frame
+missing_values <- sum(is.na(Analysis_data)) # Total number of missing values
+proportion_missing <- missing_values / total_elements # Proportion of missing values
+print(paste0("proportion of missing values: ",round(proportion_missing*100,2),"%"))
+# multiple imputation
+m_imps  <- trunc(1.1 * proportion_missing * 100) 
+print(paste0("Number of multiply imputed datasets: ", m_imps))
+#MI method
+meth1 <- make.method(training_combined, defaultMethod = "2l.pan")
+# Create the post-processing function to constrain values between 0 and 100
+Analysis_data_summary <-
+Analysis_data %>% 
+  summarise(
+  higher_education_max = max(higher_education, na.rm = TRUE),
+  higher_education_min = min(higher_education, na.rm = TRUE),
+  population_density_max = max(population_density,na.rm = TRUE),
+  population_density_min = min(population_density,na.rm = TRUE),
+  population_density_2min = (population_density%>%unique()%>%sort()%>%.[2])/2,
+  high_income_max = max(high_income, na.rm = TRUE),
+  high_income_min = min(high_income, na.rm = TRUE),
+  tech_affinity_max = max(tech_affinity,na.rm = TRUE),
+  tech_affinity_min = min(tech_affinity,na.rm = TRUE),
+  greens_vote_prop_max = max(greens_vote_prop,na.rm = TRUE),
+  greens_vote_prop_min = min(greens_vote_prop,na.rm = TRUE),
+  )
+#define post-processing 
+post1 <- make.post(training_combined)
+post1["higher_education"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$higher_education_max,"))")
+post1["population_density"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$population_density_max,"))")
+post1["high_income"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$high_income_max,"))")
+post1["tech_affinity"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$tech_affinity_max,"))")
+post1["greens_vote_prop"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$greens_vote_prop_max,"))")
+```
+
+# Performing MICE 
+1.  Further specifying the post treatment of the imputations from examining maximum values across years
+```{r, multiple imputation, results='hide'}
+# Include all downstream analysis variables in imputation model
+analysis_vars = names(X_train%>%select(-c("lga_code","year")))
+
+# develop predictor matrix for imputation model
+pred1 <- quickpred(training_combined, mincor = 0.3, include = analysis_vars, exc = "lga_code")
+
+# Cluster group variable and set random effects for time-variant covariates
+pred1[, "lga_code"] <- -2
+pred1[c("higher_education","high_income","tech_affinity","greens_vote_prop"),c("year")] <- 2
+
+#### Imputation via mice
+maxit <- 15
+mimputed_training_combined <- 
+  mice(data = training_combined, m = m_imps, predictorMatrix = pred1,method = meth1,post = post1, maxit = maxit, seed = 42)
+
+#Save the mids object to a file
+save(mimputed_training_combined, file = "mimputed_training_combined.RData")
+```
+
+### Imputation Diagnostics Training Data set
+```{r Diagnostic on Convergence}
+#load("mimputed_training_combined.RData")
+# Check convergence
+plot(mimputed_training_combined,c("higher_education","high_income","tech_affinity","greens_vote_prop","population_density")) 
+```
+
+```{r training density plot}
+# Load the mids object from the file
+#load("imputed_data_clustering.RData")
+densityplot(mimputed_training_combined)
+```
+
+```{r inspect the imputed dataset}
+example_df <- mice::complete(mimputed_training_combined,1)
+example_df
+```
+
+## Correct zero values in trajectories with linear interpolation/extrapolation approximation
+It is noticed that the multiple imputation under mice algorithm has imputed with zero values that are out of trend with particular lga trajectories. This can be fixed with simple linear interpolation and extrapolation approximations. The function takes a multiply imputed data set (mids) object, re-imputes the zero values via linear interpolation/extrapolation, then converts to a list of dataframes.
+
+```{r linear interpolation correction}
+handlers("progress")
+handlers("txtprogressbar", "beepr")
+handlers(handler_pbcol(enable_after = 3.0))
+handlers(handler_progress(complete = "#"))
+
+# Function to interpolate and extrapolate missing values indicated by zeros
+interpolate_extrapolate <- function(df, id_col, time_col, value_col) {
+  df <-
+    df %>%
+    arrange(!!sym(id_col), !!sym(time_col)) %>%
+    group_by(!!sym(id_col)) %>%
+    mutate(
+      # Check if all values in the group are zero
+      all_zeros = all(!!sym(value_col) == 0),
+      # Replace zeros with NA for interpolation
+      temp_value = ifelse(all_zeros, !!sym(value_col), ifelse(!!sym(value_col) == 0, NA,!!sym(value_col) )),
+      # Interpolate missing values (NA)
+      interpolated_value = ifelse(all_zeros, !!sym(value_col), na.approx(temp_value, na.rm = FALSE, rule = 2)),
+      ## Extrapolate missing values (NA) at the boundaries
+      extrapolated_value = ifelse(all_zeros, !!sym(value_col), na.locf(na.locf(interpolated_value, na.rm = FALSE), fromLast = TRUE))
+    ) %>%
+    # Replace original values with the interpolated and extrapolated values
+    mutate(!!sym(value_col) := extrapolated_value) %>%
+    # Drop temporary columns
+    select(-temp_value, -interpolated_value, -extrapolated_value, -all_zeros) %>%
+    ungroup()
+  return(df)
+}
+# Function to process mids object and apply interpolation/extrapolation to specified columns
+correct_mids_columns <- function(mids_obj, id_col, time_col, value_columns) {
+  
+  # Initialize progress bar
+  pb <- progressor(along = 1:mids_obj$m)
+  # Convert the mids object to a list of dataframes
+  completed_data_list <- lapply(1:mids_obj$m, function(i) mice::complete(mids_obj, action = i))
+
+  # Define a function to apply the interpolation/extrapolation to each dataframe
+  process_each_df <- function(df) {
+    
+    for (value_col in value_columns) {
+      df <- interpolate_extrapolate(df, id_col, time_col, value_col)
+    }
+    
+    # Check for NAs in the dataframe
+    total_na <- sum(is.na(df))
+    if (total_na > 0) {
+      warning(sprintf("Warning: There are %d NA values in the processed dataframe.", total_na))
+    }
+    
+    pb()
+    return(df)
+  }
+  # Apply the function to each dataframe in the list
+  processed_data_list <- lapply(completed_data_list, process_each_df)
+  
+  return(processed_data_list)
+}
+# variable to correct zero values via interpolation/extrapolation
+value_columns <- c("higher_education","population_density","high_income","tech_affinity","greens_vote_prop")
+id_col <- 'lga_code'
+time_col <- 'year'
+
+# output to list of dataframes
+#training data
+with_progress({processed_training_data_list <- correct_mids_columns(mimputed_training_combined, id_col, time_col, value_columns)})
+```
+
+### Further segregate data
+1. Remove the auxiliary variables from the combined data set.
+```{r Extract auxiliary variable}
+#helper function to remove auxiliary varables
+remove_cols <- function(df,cols_vector){
+  df <- df %>% select(-all_of(cols_vector))
+  return(df)
+}
+# remove the auxiliary and target variable
+remove_auxiliary <- c(selected_Aux_var[!selected_Aux_var %in% c('lga_code','year')],'region')
+# Extract auxiliary variables from training and testing data sets
+training_data_list <- lapply(processed_training_data_list,remove_cols,remove_auxiliary)
+
+print("The columns are: ")
+names(training_data_list[[1]])
+```
+## Cluster Analysis Under Multiple Imputation
+## Convert dataframes to ClusterLongData3d objects
+The list of dataframes are to then be be converted to a list of 3d arrays. The processing function, $clusterLongData3d()$ (cld3d) is then applied to each of the 3d arrays in the list to return a list of cld3d objects ready to apply the kml3d algorithm. 
+```{r prepare data for clustering cluster data}
+# Function to process mids object and convert to list of 3D arrays
+list_to_3d_array <- function(processed_data_list, id_col2, time_col2, value_columns2) {
+  
+  # Initialize progress bar
+  pb <- progressor(along = processed_data_list)
+  
+  # Define process function to convert list of dataframes to list of 3D arrays
+  process_data <- function(df) {
+    # Ensure data is sorted by ID and Time
+    df <- df %>% arrange(!!sym(id_col2), !!sym(time_col2))
+    
+    # Select relevant variables
+    df <- df %>% select(all_of(c(id_col2, time_col2, value_columns2)))
+    
+    # Calculate dimensions
+    dim1 <- length(unique(df[[id_col2]]))
+    dim2 <- length(unique(df[[time_col2]]))
+    dim3 <- length(value_columns2)
+
+    # Initialize an empty 3D array
+    array_data <- array(NA, dim = c(dim1, dim2, dim3))
+
+    # Populate the 3D array
+    for (var_idx in 1:dim3) {
+      var_name <- colnames(df)[var_idx + 2]  # +2 to skip ID and Time columns
+      for (ind_idx in 1:dim1) {
+        individual_data <- df %>% filter(!!sym(id_col2) == unique(df[[id_col2]])[ind_idx]) %>% pull(var_name)
+        array_data[ind_idx, , var_idx] <- individual_data
+      }
+    }
+    # Update progress bar
+    pb()
+    
+    return(array_data)
+  }
+  
+  # Convert the list of dataframes to list of 3D arrays
+  array_list <- lapply(processed_data_list, process_data)
+  
+  return(array_list)
+}
+
+value_columns2 <- c("fast_dc_chargers",
+                   "higher_education",
+                   "population_density",
+                   "high_income",
+                   "tech_affinity",
+                   "greens_vote_prop",
+                   "neighbourhood_ev_prop",
+                   "log_distance_capital")
+id_col2 <- 'lga_code'
+time_col2 <- 'year'
+
+# apply the function to processed list of dataframes
+with_progress({array_list <- list_to_3d_array(training_data_list, id_col2, time_col2, value_columns2)})
+
+# apply the clusterLongData3d() function to the list of 3darrays
+idAll <- unique(example_df[[id_col2]])
+time <- unique(example_df[[time_col2]])
+Cld3d_list <- lapply(array_list,
+                    FUN = clusterLongData3d,
+                    idAll = as.character(idAll),
+                    time = time,
+                    varNames = value_columns2)
+
+```
+Perform Clustering using $kml3d()$  for clustering multivariate longitudinal data. Clustering via a new implementation of k-means for multivariate longitudinal data. Perform clustering and diagnostic for randomly selected $cld3d$ object in list to determine the optimal number of cluster partitions.
+```{r Clustering diagnostic}
+# Function to randomly select an element from a list
+random_select <- function(lst) {
+  selected_element <- sample(lst, 1)[[1]]
+  return(selected_element)
+}
+# randomly select cld3d object 
+random_Cld3d <- random_select(Cld3d_list)
+
+kml3d(random_Cld3d,2:6,40,toPlot="criterion")
+```
+# Cluster Analysis
+1. based on the "best" number of clusters as identified via the quality criterion presented in the above plot, perform cluster analysis.
+```{r cluster Partitions, results='hide'}
+nb.clust <- 3
+partitions_list <- list()
+
+# function to extract partition from cld3d objects after clustering with kml3d
+extract_partition <- function(cld3d,nb.clust){
+  partition <- getClusters(cld3d,nb.clust, asInteger = TRUE)
+  return(partition)
+}
+
+# Loop through the list of Cld3d objects
+for (i in 1:length(Cld3d_list)) {
+  data <- Cld3d_list[[i]]
+  
+  params <- parKml3d(maxIt = 1000, 
+                     centerMethod = function(x){median(x,na.rm=TRUE)}, 
+                     scale = TRUE, 
+                     imputationMethod = 'linearInterpol.bisector',
+                     startingCond = "randomAll"
+                     )
+  # Perform the clustering algorithm
+  kml3d(data, nb.clust,nbRedrawing = 150, parAlgo = params )
+  
+  # Extract the clustering partition for the current data
+  partition <- extract_partition(data,nb.clust)
+  
+  # Store the extracted partition in the partitions_list
+  partitions_list[[i]] <- partition
+}
+```
+
+ Impute NA values with modal value .
+ 
+```{r fix NA values}
+most_common_at_each_index <- function(list_of_vectors) {
+  # Determine the length of the vectors (assuming all vectors have the same length)
+  vec_length <- length(list_of_vectors[[1]])
+  
+  # Initialize a vector to store the most common values
+  result_vector <- integer(vec_length)
+  
+  # Calculate the overall most common value for the entire list
+  overall_values <- unlist(list_of_vectors)
+  overall_values <- overall_values[!is.na(overall_values)]
+  overall_most_common_value <- as.integer(names(which.max(table(overall_values))))
+  
+  # Loop through each index
+  for (i in 1:vec_length) {
+    # Extract the values at index i from all vectors, excluding NAs
+    values_at_index <- sapply(list_of_vectors, function(vec) vec[i])
+    values_at_index <- values_at_index[!is.na(values_at_index)]
+    
+    # Determine the most common value at this index
+    if (length(values_at_index) == 0) {
+      result_vector[i] <- overall_most_common_value
+    } else {
+      most_common_value <- as.integer(names(which.max(table(values_at_index))))
+      result_vector[i] <- most_common_value
+    }
+  }
+  
+  return(result_vector)
+}
+
+impute_missing_values <- function(list_of_vectors) {
+  # Get the most common values for each index
+  most_common_vector <- most_common_at_each_index(list_of_vectors)
+  
+  # Loop through each vector and impute missing values
+  imputed_vectors <- lapply(list_of_vectors, function(vec) {
+    vec[is.na(vec)] <- most_common_vector[is.na(vec)]
+    return(vec)
+  })
+  
+  return(imputed_vectors)
+}
+# impute missing values using modal value
+partitions_list_imputed <-impute_missing_values(partitions_list)
+
+# Apply the fastnmf function on the list of partitions
+pooled_clusters <- fastnmf(partitions_list_imputed, nb.clust = nb.clust)$cluster
+save(pooled_clusters, file = "pooled_clusters.RData")
+```
+```{r cluster frequency}
+table(pooled_clusters)
+```
+### Assign cluser labels
+1. Assign cluster labels to original training and testing sets, combined with Auxiliary variables
+```{r assign cluster labels}
+#load("pooled_clusters.RData")
+
+  # Create a mapping of LGA to cluster labels
+lga_cluster_map <- data.frame(lga_code = unique(training_combined$lga_code), cluster = as.factor(pooled_clusters))
+
+# Assign clusters to the training data by merging
+X_train_combined <- merge(training_combined,lga_cluster_map,by = "lga_code")
+# Assign clusters to the testing data by merging  
+X_test_combined <- merge(testing_combined,lga_cluster_map,by = "lga_code")
+```
+
+### Define processing and transformation helper functions
+1. Reframe the panel data structure to a supervised learning problem, based on the sliding window size and forecast horizon, restructuring the panel data by creating training sequences of the feature set to predict target variable at forecast horizon time points.
+2. Preprocess sequence data by encoding categorical variable, dropping zero variance variables and normalising variables.
+```{r reframing panel data}
+
+panel_to_supervised <- function(X, y, window_size, forecast_horizon, time_invariant_cols) {
+  sequences_list <- list()
+  # temporarily combine outcome to predictor feature set.
+  X<- bind_cols(X, y)
+  
+  # Identify time-variant columns
+  time_variant_cols <- setdiff(names(X), c('lga_code',"ev_prop", "year", time_invariant_cols))
+  
+  for (L in unique(X$lga_code)) {
+    LGA_data <- subset(X, lga_code == L)
+    LGA_data <- LGA_data[order(LGA_data$year), ]
+    
+    # Extract time-invariant features for this LGA
+    time_invariant_data <- unique(LGA_data[, time_invariant_cols, drop = FALSE])
+    sequence_number <- 0
+    
+    for (i in 1:(nrow(LGA_data) - window_size - forecast_horizon + 1)) {
+      seq <- LGA_data[i:(i + window_size - 1), time_variant_cols, drop = FALSE]
+      
+      # Flatten the sequence to a single row
+      seq_vector <- as.vector(t(seq))
+      
+      # Create the sequence as a data frame
+      seq_df <- as.data.frame(t(seq_vector))
+      
+      # Rename columns for time-variant features
+      new_colnames <- unlist(lapply((window_size:1) - 1, function(w) paste0(time_variant_cols, ".t-", w)))
+      colnames(seq_df) <- new_colnames
+      
+      # Add time-invariant features
+      for (col in time_invariant_cols) {
+        seq_df[[col]] <- time_invariant_data[[col]]
+      }
+      
+      # Add sequence number
+      sequence_number <- sequence_number + 1
+      seq_df$sequence_number <- sequence_number
+      
+       # Append forecast target (single point estimate)
+      target_col <- LGA_data[i + window_size + forecast_horizon - 1, "ev_prop"]
+      #
+      seq_df[['ev_prop']] <- target_col$ev_prop
+      
+      sequences_list[[length(sequences_list) + 1]] <- seq_df
+    }
+  }
+  
+  combined_df <- do.call(rbind, sequences_list)
+  
+  return(combined_df)
+}
+
+
+reframe <- function(imputed_X_train_list, 
+                    imputed_X_test_list,
+                    y_train,
+                    y_test,
+                    window_size,
+                    forecast_horizon,
+                    time_invariant_cols){
+  # Initialize progress bar
+  pb <- progressor(along = 1:m_imps)
+  # Apply preprocessing to each imputed dataset
+  seq_train_list <- list()
+  seq_test_list <- list()
+  for (i in 1:m_imps) {
+    imputed_X_train <- imputed_X_train_list[[i]]
+    imputed_X_test <- imputed_X_test_list[[i]]
+    # reframe datasets
+    train_seq <- panel_to_supervised(imputed_X_train, y_train, window_size, forecast_horizon, time_invariant_cols)
+    test_seq <- panel_to_supervised(imputed_X_test, y_test, window_size, forecast_horizon, time_invariant_cols)
+    #apply preprocessing to training data
+    seq_train_list[[i]] <- train_seq
+    seq_test_list[[i]] <- test_seq
+    #increment progress bar
+    pb()
+  }
+  return(list(seq_train_list,seq_test_list))
+}
+
+overall_offset_pop_dense <- function(imputed_X_train_list,imputed_X_test_list){
+  pb <- progressor(along = 1:m_imps)
+  # Initialize vectors to store second smallest values
+  second_smallest_vals <- c()
+  for (i in 1:m_imps) {
+    imputed_X_train <- imputed_X_train_list[[i]]
+    imputed_X_test <- imputed_X_test_list[[i]]
+    second_smallest_vals <- c(second_smallest_vals,half_second_smallest(imputed_X_train$population_density))
+    second_smallest_vals <- c(second_smallest_vals,half_second_smallest(imputed_X_test$population_density))
+  }
+  # Remove NAs
+  second_smallest_vals <- na.omit(second_smallest_vals)
+  # Determine the overall second smallest values
+  overall_second_smallest_vals <- sort(unique(second_smallest_vals))[1]
+  return(overall_second_smallest_vals)
+}
+```
+
+
+# Supervised Learning  - Training forecast model of EV uptake
+## Global models
+1. Multiple Imputation of training data set combined with auxiliary variables and assigned cluster label
+2. drop redundant variables.
+3. Reframe panel structure to supervised learning problem
+4. Define preprocessing pipeline and train model
+5. 
+```{r Multiple Imputation}
+value_columns = c("higher_education","high_income","tech_affinity","greens_vote_prop","population_density")
+
+#### Multiple Imputation
+meth2 <- make.method(X_train_combined, defaultMethod = "2l.pan")
+# develop predictor matrix for imputation model
+pred2 <- quickpred(X_train_combined, include = c(analysis_vars,"cluster") , mincor = 0.30, exc = "lga_code")
+# Cluster group variable and set random effects for time-variant covariates
+pred2[, "lga_code"] <- -2
+pred2[value_columns,c("year")] <- 2
+# Post-processing
+post2 <- make.post(X_train_combined)
+post2["higher_education"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$higher_education_max,"))")
+post2["population_density"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$population_density_max,"))")
+post2["high_income"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$high_income_max,"))")
+post2["tech_affinity"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$tech_affinity_max,"))")
+post2["greens_vote_prop"] <- paste0("imp[[j]][, i] <- squeeze(imp[[j]][, i], c(0,", 1.05*Analysis_data_summary$greens_vote_prop_max,"))")
+# Perform multiple imputation on combined data set
+X_train_combined_imputed <- 
+  mice(data = X_train_combined, m = 30, predictorMatrix = pred2, method = meth2, post = post2, maxit = maxit, seed = 42)
+
+X_test_combined_imputed <- 
+  mice.mids(X_train_combined_imputed, newdata = X_test_combined)
+
+#plot convegence of distribution over iterations
+plot(X_train_combined_imputed,value_columns) 
+
+# plot distribution of actual and imputed data
+densityplot(X_train_combined_imputed)
+densityplot(X_test_combined_imputed)
+```
+### Inspect multiply imputed data sets
+```{r inspect mids}
+mice::complete(X_train_combined_imputed,3)
+#Save the mids object to a file
+# Save the workspace to a file named "my_workspace.RData"
+#save.image(file = "my_workspace.RData")
+```
+
+### Preprocessing data step
+```{r preprocess data}
+# correct zero imputation via interpolation/extrapolation methods
+with_progress({imputed_X_train_list <- correct_mids_columns(X_train_combined_imputed, id_col, time_col, value_columns)})
+with_progress({imputed_X_test_list <- correct_mids_columns(X_test_combined_imputed, id_col, time_col, value_columns)})
+
+# Extract auxiliary variables from training and testing data sets
+imputed_X_train_list <- lapply(imputed_X_train_list,remove_cols,remove_auxiliary)
+imputed_X_test_list <- lapply(imputed_X_test_list,remove_cols,remove_auxiliary)
+
+# Determine overall Shift for Population Density
+pop_dense_shift <- overall_offset_pop_dense(imputed_X_train_list,imputed_X_test_list)
+```
+### visualise distributions of multiply imputed variables
+```{r density plot}
+
+# Combine dataframes into one with an identifier
+imputed_combined_df <- bind_rows(imputed_X_train_list, .id = "source")
+
+# Convert the dataframe to long format for ggplot
+iimputed_combined_df_long <- imputed_combined_df%>%select(-c("lga_code","year")) %>%
+  pivot_longer(cols = all_of(value_columns), names_to = "variable", values_to = "value")
+
+
+x_train_long <- X_train %>% select(-c("lga_code","year")) %>%
+pivot_longer(cols = all_of(value_columns), names_to = "variable", values_to = "value")
+
+
+# Reshape the dataframe into long format
+p<-ggplot(combined_df_long, aes(x = sqrt(value), color = source)) +
+  geom_density()
+
+
+p<- p + geom_density(data = x_train_long, aes(x = sqrt(value)), color = "black", linewidth = 1 ) 
+
+ p+ facet_wrap(~ variable, scale = "free") +
+  labs(title = paste0("Density Plot of different variables from Multiply Imputed datasets \n compared to original dataset shown as black"),
+       y = "Density"
+       )+ 
+  theme(legend.position = "none")
+
+```
+### Inspect correlation structures
+```{r correlation of variables}
+ n <- sample(1:m_imps, 1)
+train_data <- imputed_X_train_list[[n]]
+test_data <- imputed_X_test_list[[n]]
+X_combine_data <- bind_rows(train_data,test_data)
+y_combine_data <- bind_rows(y_train, y_test)
+  # Calculate the correlation matrix
+cor_matrix <- bind_cols(X_combine_data,y_combine_data) %>% select_if(~is.double(.)) %>%cor()
+# Convert the correlation matrix to long format
+cor_matrix_melt <- melt(cor_matrix)
+
+# Create the heatmap using ggplot2
+ggplot(data = cor_matrix_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), space = "Lab", 
+                       name = "Correlation") +
+  labs(title = "Correlation Matrix Heatmap of Analysis Variables After Imputation")+
+  
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        axis.ticks = element_blank()) +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 4)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, size = 12, hjust = 1)) +
+  scale_x_discrete(limits = levels(cor_matrix_melt$Var1)) +
+  scale_y_discrete(limits = rev(levels(cor_matrix_melt$Var2)))
+
+```
+
+
+## Reframe panel data to Supervised Learning problem
+```{r reframe datasets}
+# Define parameters
+window_size <- 3
+horizon <- 1
+# Specify time-invariant columns
+ti_cols <- c("lga_code","state", "log_distance_capital", "cluster")
+# Preprocess Training data list
+with_progress({seq_data_lists <- reframe(imputed_X_train_list, imputed_X_test_list, y_train, y_test,window_size,horizon,ti_cols)})
+# reassign train test data
+seq_train_list <- seq_data_lists[[1]]
+seq_test_list <- seq_data_lists[[2]]
+```
+### Examine reframed, preprocessed dataset
+```{r examine dataset}
+train_example <- seq_train_list[[1]]
+train_example 
+```
+### Global and Cluster-based modelling
+1. Train and evaluate candidate global models for varying training window sizes for a 1 and 2 year forecast horizon.
+2. Filter data-set by cluster and train and evaluate candidate models for varying window sizes for a 1 and 2 year forecast horizon.
+```{r Filter by Cluster}
+filter_datasets <- function(dataset_list,cluster_no){
+  filtered_datasets <- list()
+  for (i in 1:m_imps) {
+    filtered_datasets[[i]] <-
+      dataset_list[[i]] %>% 
+      filter(cluster == cluster_no) %>%
+      select(-cluster)
+  } 
+  return(filtered_datasets)
+}
+
+cluster_no <- 3
+seq_train_filtered <- filter_datasets(seq_train_list,cluster_no)
+seq_test_filtered <- filter_datasets(seq_test_list, cluster_no)
+```
+
+### Creating case weights for weighted supervised learning
+Emphasize the modelling of lgas with greater BEV share, Without directly using the Target variable to prevent data leakage.
+Use log distance to capital city as proxy measure of BEV uptake. 
+```{r creating weights}
+# Custom function to normalize data to a range [a, b]
+normalize_custom_weights <- function(x, a) {
+  if (sum(x) == 0) {
+    return(rep(a, length(x)))
+  } else {
+    return((1 - a) * (x - min(x)) / (max(x) - min(x)) + a)
+  }
+}
+
+# Custom function to normalize data to a range [a, b]
+sequence_weights <- function(seq, base) {
+  return(base^(max(seq)-seq))
+}
+
+```
+
+### Model fitting
+Compare out-of-box models
+1. Specify ElasticNet and Random Forest regression models 
+2. Define Cross-Validation scheme
+   - Ensure Temporal structure of LGA trajectory is respected.
+   - As all LGAs are accounted for and no new LGAs are expected in future sets, LGAs can reside in both train and validation sets.
+   Employ time-series cross validation.
+3. Tune model via a tune grid under rolling window validation
+3. Employ under
+
+```{r model specification}
+# Evaluate futures in parallel - max of two workers to avoid hogging resources
+future::plan("multisession", workers = future::availableCores()-1)
+
+### Out of Box comparisons
+#Elstic Net linear model
+elasticnet_spec <- linear_reg(penalty = 0.027,mixture = 0.6) %>% # this is a mixture of both L1 and L2. 
+  set_mode("regression") %>% 
+  set_engine("glmnet") 
+#support vector machine
+svm_spec <- svm_poly() %>%
+  set_mode("regression") %>%
+  set_engine("kernlab")
+#Random Forest
+rf_spec <- rand_forest(trees = 450) %>%
+  set_mode("regression") %>%
+  set_engine("ranger", importance =  "permutation")
+# k nearest neighbour regression
+knn_spec <- nearest_neighbor() %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+#XGBoost
+xgb_spec <- boost_tree(trees = 450) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost") 
+
+#models list
+models_specs <- list(
+  elasticnet = elasticnet_spec,
+  svmpoly = svm_spec,
+  randomforest = rf_spec,
+  knn = knn_spec,
+  xgboost = xgb_spec
+  )
+
+get_resample_predictions <- function(datasets, models){
+  
+  all_results <- list()
+  
+  #arrange by sequence number
+   n <- sample(1:m_imps, 1)
+  seq_train <- datasets[[n]]
+  
+  seq_train <- seq_train %>%
+    arrange(sequence_number) %>%
+    #group_by(lga_code) %>%
+    #mutate(weight = sequence_weights(sequence_number,0.5),
+    #       weight = hardhat::importance_weights(weight)) %>%
+    #ungroup()%>%
+    mutate(ev_prop = log(ev_prop + ev_prop_shift),#Log transformation
+             across(starts_with("population_density"),~log(. + pop_dense_shift)),
+             across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift)),
+             across(starts_with("higher_education"),~sqrt(.)),
+             across(starts_with("high_income"),~sqrt(.)),
+             across(starts_with("tech_affinity"),~sqrt(.)),
+             across(starts_with("greens_vote_prop"),~sqrt(.)))
+  
+  # initialise recipe and workflow
+  model_recipe <- recipe(~ ., data = seq_train) %>%
+    #step_rm(sequence_number) %>%
+    update_role(sequence_number, new_role = "excluded") %>%
+    update_role(ev_prop, new_role = "outcome") %>%
+    update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+    step_dummy(all_nominal(), -all_outcomes()) %>%
+    step_interact(terms = ~log_distance_capital:starts_with('state')) %>%
+    step_zv(all_predictors(),-all_outcomes()) %>%
+    step_normalize(all_predictors(), -all_outcomes())
+  
+  #create workflow for each model
+  workflows <- lapply(models_specs, function(spec){
+    workflow() %>%
+    #  add_case_weights(weight) %>%
+      add_recipe(model_recipe) %>%
+      add_model(spec)
+  })
+  
+  # define cross-validation scheme 
+  #train on 2 sequences and assess on 1 sequence, sliding the scheme at 1 increment at a time,
+  #Being panel data, all LGAs are grouped into the window.
+  time_series_folds <- time_series_cv(seq_train,
+                                      date_var = sequence_number,
+                                      initial = 1,
+                                      assess = 1,
+                                      cumulative = TRUE,
+                                      skip = 1)
+  #set plan
+  time_series_folds %>% tk_time_series_cv_plan()
+  
+  # perform resampling predictions model out-of-the-box
+  model_results <- lapply(workflows, function(wf) {
+  fit_resamples(wf, resamples = time_series_folds, control = control_resamples(save_pred = TRUE))
+  })
+  
+  # extract the predictions from each resampling fold for each model
+  all_model_predictions <- list()
+  for (j in 1:length(model_results)){
+    model_name <- names(models_specs)[j]
+    model_fit <- model_results[[j]]
+    model_predictions <- model_fit %>%
+      collect_predictions() %>%
+      mutate(model = model_name)
+  all_model_predictions[[j]] <- model_predictions   
+  }
+  
+  #collect all rolling validation results for the models
+  all_results <- bind_rows(all_model_predictions)
+
+# aggregate predictions at each row
+return(all_results %>% group_by(model,id,.row) %>%
+         summarise(agg_pred = mean(exp(.pred) - ev_prop_shift),
+                   evprop = mean(exp(ev_prop) - ev_prop_shift),
+       drop = ".group"))
+}
+
+with_progress({all_results_aggregate <- get_resample_predictions(seq_train_list,models_specs)})
+```
+
+## Evaluate the models 
+1. use metrics of RMSE, MAE, SMAPE
+```{r evaluate models}
+
+metrics_test <- metric_set(smape, yardstick::rmse, yardstick::mae)
+n_samp <- n_distinct(time_series_folds$id) 
+
+results1 <- metrics_test(all_results_aggregate,truth = evprop,estimate = agg_pred) 
+results1 <-
+results1 %>% 
+group_by(model,.metric) %>%
+  summarise( mean_score = mean(.estimate),
+             std_err = sd(.estimate)/sqrt(n_samp),
+             .groups = 'drop')
+g1<- results1 %>%
+  ggplot(aes(x = model, y = mean_score))+
+  geom_bar(stat = "identity", fill = "skyblue", alpha = 0.7)+
+  geom_errorbar(aes(ymin = mean_score - std_err, ymax = mean_score + std_err), width = 0.3, color = "red3")+
+  theme(axis.text.x = element_text(angle = 45,hjust = 1))+
+  facet_wrap(vars(.metric ), scales = "free") +
+  labs( title = paste0("Evaluation of candidate models for LGA cluster group ",cluster_no," with forecast horizon of ", horizon," under rolling validation"),
+        x = "Candidate models",
+        y = "mean validation score")+
+  theme(plot.title = element_text(size = 11))  # Change the title size
+g1  
+```
+
+```{r save workspace}
+save.image(file = "my_workspace.RData")
+```
+
+From the repeated experiments, the two candidate models that are shorted listed are Random Forest and Xgboost. These two models out-of-the-box achieve the better performance for a sliding window of 3 and for direct forecasts at horizons of 1 and 2.
+Both models are to be tuned under a sliding window of 3 and across all multiply imputed datasets.
+
+ ### Tuning best candidate models
+ 1. Run an initial model tune using tuning grid.
+ 2. Perform tuning of all models under multiple imputation with Bayesian optimization of model parameters.
+```{r}
+model_collection <- list()
+```
+
+
+```{r}
+# Load the workspace from the file "my_workspace.RData"
+load(file = "my_workspace.RData")
+```
+
+### clear variables to reduce memory consumption
+```{r clean up global variables}
+remove_list <- c(Cld3d_list,
+                 array_list,
+                 combined_df_long,
+                 data,
+                 data_filtered,
+                 ev_prop_22,
+                 example_df,
+                 icc_values,
+                 partitions_list,
+                 partitions_list_imputed,
+                 random_Cld3d)
+rm(remove_list)
+```
+
+
+```{r tuning models}
+# Evaluate futures in parallel - max of two workers to avoid hogging resources
+#future::plan("multisession", workers = future::availableCores()-4)
+
+set.seed(3254)
+# Define parameters
+window_size <- 3
+horizons <- 1:2
+#loop through all cluster models
+cluster_nos <- 1:3
+all_validation_predictions <- list()
+all_test_predictions <- list()
+#define metrics
+metrics_test <- metric_set(yardstick::rmse, yardstick::mae, smape)
+
+i <- 1
+for (horizon in horizons){
+  # Preprocess Training data list
+  with_progress({seq_data_lists <- reframe(imputed_X_train_list, imputed_X_test_list, y_train, y_test,window_size,horizon,ti_cols)})
+  # reassign train test data
+  seq_train_list <- seq_data_lists[[1]]
+  seq_test_list <- seq_data_lists[[2]]
+  #number of datasets for test
+  #n <- sample(1:m_imps, 1)
+  stacked_train_dataset <- bind_rows(seq_train_list)
+  stacked_test_dataset <- bind_rows(seq_test_list)
+  
+  for (cluster_no in cluster_nos){
+    
+      # Filter for clusters
+    sample_train_dataset_filtered <- stacked_train_dataset %>% 
+      filter(cluster == cluster_no) %>%
+      select(-cluster)
+    
+    # Filter for clusters
+    sample_test_dataset_filtered <- stacked_test_dataset %>% 
+      filter(cluster == cluster_no) %>%
+      select(-cluster)
+    
+    #arrange by sequence number and transform variables in dataset 
+    seq_train <- sample_train_dataset_filtered %>% 
+      arrange(sequence_number) %>%
+      group_by(lga_code) %>%
+      mutate(weight = sequence_weights(sequence_number,0.75),
+             weight = hardhat::importance_weights(weight)) %>%
+      ungroup()%>%
+      mutate(ev_prop = log(ev_prop + ev_prop_shift),#Log transformation
+             across(starts_with("population_density"),~log(. + pop_dense_shift)),
+             across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift)))
+      
+        ##### initialise models and tuning grids
+    #Elstic Net linear model
+    elasticnet_spec2 <-
+      linear_reg(penalty =tune(),mixture = tune()) %>% # this is a mixture of both L1 and L2. 
+      set_mode("regression") %>% 
+      set_engine("glmnet")
+    
+    #elastic net tuning grid
+    enlinear_grid <- grid_random(
+      penalty(),
+      mixture(),
+      size = 100
+      )
+    # define time_series cross validation
+    time_series_folds <- time_series_cv(seq_train,
+                                        date_var = sequence_number,
+                                        initial = 1,
+                                        assess = 1,
+                                        cumulative = TRUE,
+                                        skip = 1)
+    #set plan
+    time_series_folds %>% tk_time_series_cv_plan()
+    
+    # initialise recipe and workflow
+    initial_model_recipe <- recipe(ev_prop~ ., data = seq_train) %>%
+      step_rm(sequence_number) %>%
+      update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+      step_poly(starts_with("population_density")) %>%
+      step_poly(starts_with("higher_education")) %>%
+      step_poly(starts_with("high_income")) %>%
+      step_poly(starts_with("tech_affinity")) %>%
+      step_poly(starts_with("Greens_Vote_prop")) %>%
+      step_dummy(all_nominal(), -all_outcomes()) %>%
+      step_interact(terms = ~log_distance_capital:starts_with('state'),keep_original_cols = FALSE) %>%
+      step_zv(all_predictors(),-all_outcomes()) %>%
+      step_normalize(all_predictors(), -all_outcomes()) %>%
+      step_intercept()
+    
+      # Linear model workflow
+    enlinear_workflow <- workflow() %>%
+      add_model(elasticnet_spec2) %>%
+      add_case_weights(weight) %>%
+      add_recipe(initial_model_recipe)
+    
+    # tuning results  
+    enlinear_tune_results <- tune_grid(enlinear_workflow, resamples = time_series_folds, metrics = metrics_test,  grid = enlinear_grid)  
+    
+    bayes_param_enlinear <- 
+      enlinear_workflow %>% 
+      extract_parameter_set_dials() 
+    
+    #optimise hyperparameters
+    enlinear_bayes_results <- tune_bayes(enlinear_workflow,
+                                         resamples = time_series_folds,
+                                         param_info = bayes_param_enlinear,
+                                         initial = enlinear_tune_results, 
+                                         metrics = metrics_test,
+                                         iter = 4,
+                                         control = control_bayes(verbose = TRUE, verbose_iter = TRUE, no_improve = 3))
+    # select best model        
+    enlinear_best_params <- select_best(enlinear_tune_results,metric = "smape")
+    enlinear_final_wf <- finalize_workflow(enlinear_workflow, enlinear_best_params)
+    # Fit the linear model
+    fitted_linear_model <- fit(enlinear_final_wf, data = seq_train)
+    #predictions with linear model
+    y_lin_fit <- predict(fitted_linear_model, new_data = seq_train)
+    
+    # Clamp the linear model predictions
+    clamped_max <- max((seq_train %>% 
+      filter(sequence_number == max(sequence_number)))$ev_prop)
+    clamped_min <- log(ev_prop_shift)
+   
+    # Clamp the linear model predictions
+    y_lin_fit$.pred <- pmax(pmin(y_lin_fit$.pred, clamped_max), clamped_min)
+    plot(y_lin_fit$.pred-seq_train$ev_prop, seq_train$ev_prop)
+    
+    # Bind the truth target variable 'ev_prop' with the predictions
+    lin_result <- bind_cols(.row=1:length(seq_train$ev_prop),ev_prop = seq_train$ev_prop,lin_pred = y_lin_fit$.pred)
+    
+    # Extract residuals and create weights based on residuals
+    seq_train2 <- seq_train %>%
+          bind_cols(y_lin_fit %>%
+                  rename(linear_pred = .pred)) %>%
+      mutate(residuals = ev_prop - linear_pred) %>%
+      select(-c("ev_prop","linear_pred"))
+   
+    #XGBoost model specification
+    xgb_spec2 <- boost_tree(trees = 350,
+                           mtry = tune(),
+                           min_n = tune(),
+                           tree_depth = tune(),
+                           learn_rate = tune(),
+                           loss_reduction = tune())%>%
+      set_mode("regression") %>%
+      set_engine("xgboost",  alpha = 2, lambda = 5)
+    
+    # Define a grid of tuning parameters for XgBoost
+    xgb_grid <- grid_random(
+      learn_rate(), 
+      tree_depth(range = c(5,10)),
+      mtry(range=c(5,20)),
+      min_n(),
+      loss_reduction(range = c(-6,-1)),
+      size = 120)  # Increase the size for a finer grid
+    
+    # define time_series cross validation
+    time_series_folds2 <- time_series_cv(seq_train2,
+                                        date_var = sequence_number,
+                                        initial = 1,
+                                        assess = 1,
+                                        cumulative = TRUE,
+                                        skip = 1)
+    #set plan
+    time_series_folds2 %>% tk_time_series_cv_plan()
+    # Define the recipe for training xgboost on residuals
+    residuals_recipe <- recipe(residuals ~ ., data = seq_train2) %>%
+      step_rm(sequence_number) %>%
+      update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+      step_poly(starts_with("population_density")) %>%
+      step_poly(starts_with("higher_education")) %>%
+      step_poly(starts_with("high_income")) %>%
+      step_poly(starts_with("tech_affinity")) %>%
+      step_poly(starts_with("Greens_Vote_prop")) %>%
+     step_dummy(all_nominal(), -all_outcomes()) %>%
+      step_interact(terms = ~log_distance_capital:starts_with('state'),keep_original_cols = FALSE) %>%
+      step_zv(all_predictors(),-all_outcomes()) 
+    
+    #create workflow for xgboost model
+    xgb_workflow <- 
+      workflow() %>%
+      add_model(xgb_spec2) %>%
+      add_case_weights(weight) %>%
+      add_recipe(residuals_recipe)
+    
+    # tuning results  
+    initial_xgb_tune_results <- tune_grid(xgb_workflow, resamples = time_series_folds2, metrics = metrics_test, grid = xgb_grid )
+    
+    #get parameters to tune
+    bayes_param_xgb <- xgb_workflow %>% 
+        extract_parameter_set_dials() %>% 
+        update(mtry = finalize(mtry(), seq_train2%>%select(-c("sequence_number",'lga_code'))))
+      
+    xgb_bayes_results <- tune_bayes(xgb_workflow,
+                                    resamples = time_series_folds2,
+                                    param_info = bayes_param_xgb,
+                                    initial = initial_xgb_tune_results,
+                                    metrics = metrics_test,
+                                    iter = 4,
+                                    control = control_bayes(verbose = TRUE, verbose_iter = TRUE, no_improve = 3))
+      # select best model        
+    xgb_best_params <- select_best(xgb_bayes_results,metric = "smape")
+    xgb_final_wf <- finalize_workflow(xgb_workflow, xgb_best_params)
+    #fit model to training set  
+    fitted_xgb_model <- fit(xgb_final_wf, data = seq_train2) 
+    #predictions with linear model
+    y_xgb_fit <- predict(fitted_xgb_model, new_data = seq_train2)
+    # fit resamples on xgboost learning the residuals for the set linear trend prediction
+    resample_results <- fit_resamples(xgb_final_wf, resamples = time_series_folds2, metrics = metrics_test, control = control_resamples(save_pred = TRUE))
+    # collect resampling predictions
+    fullmodel_fit_results <- resample_results %>%
+      collect_metrics() 
+    #collect model specifications in a list
+    model_specs2 <- list(
+      elasticnet = elasticnet_spec2,
+      xgboost = xgb_spec2
+      )
+    submodel_fits <- list(linear_model = fitted_linear_model,
+                            xgb_model = fitted_xgb_model)
+    # includer cluster model number
+    fullmodel_fit_results <- fullmodel_fit_results %>%
+      mutate(cluster_model = cluster_no,
+             forecast_horizon = horizon)
+    
+    all_validation_predictions[[i]] <- fullmodel_fit_results
+  
+    ###### Evaluate on testing set #####
+    seq_test <- sample_test_dataset_filtered
+    seq_test <- seq_test %>% 
+        arrange(sequence_number) %>%
+        mutate(ev_prop = log(ev_prop + ev_prop_shift),#Log transformation
+               across(starts_with("population_density"),~log(. + pop_dense_shift)),
+               across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift)))
+        
+    #### Make predictions with sub-models###
+    # Generalised Linear model
+    fitted_linear_model <- submodel_fits$linear_model
+    trend_predictions <- predict(fitted_linear_model, new_data = seq_test)
+    # Clamp trend_predictions
+    clamped_trend <-
+      log(((median((seq_train%>%group_by(lga_code) %>%
+      filter(sequence_number > max(sequence_number)-2)%>%
+      summarise(growth_factor = max(exp(ev_prop))/second_largest(exp(ev_prop))) %>%
+      ungroup())$growth_factor))^2)*max(exp(seq_train$ev_prop)))
+    # Clamp the linear model predictions
+    trend_predictions$.pred <- pmax(pmin(trend_predictions$.pred, clamped_trend), log(ev_prop_shift))
+   
+    #xGBoost Residual model
+    fitted_xgb_model <- submodel_fits$xgb_model
+    residual_predictions <- predict(fitted_xgb_model, new_data = seq_test)
+    
+    residual_predictions$.pred <- pmax(pmin(residual_predictions$.pred,
+                                      mean(residual_predictions$.pred)+2*sd(residual_predictions$.pred)),
+                                 mean(residual_predictions$.pred)-2*sd(residual_predictions$.pred))
+    #Boost the predictions by adding the y_preds
+    boosted_predictions <- bind_cols(trend_pred = trend_predictions$.pred, res_pred = residual_predictions$.pred) %>%
+      mutate(boost_pred = trend_pred + res_pred)
+    # combine with id and truth value  
+    predictions <- boosted_predictions %>%
+        bind_cols(seq_test%>%select(c("ev_prop","lga_code","sequence_number"))) %>%
+        arrange(sequence_number)%>%
+        mutate(ev_prop = exp(ev_prop) - ev_prop_shift,
+               boost_pred = exp(boost_pred) - ev_prop_shift)
+    
+    # outliers
+    predictions <-
+    predictions %>% 
+      filter(boost_pred< 1.5*ev_prop) 
+    
+    ##include cluster model number
+    predictions <-
+      predictions %>%
+    mutate(cluster_model = cluster_no,
+           forecast_horizon = horizon)
+    
+    all_test_predictions[[i]] <- predictions
+    i <- i + 1
+  }
+}
+
+#combine cluster model validation and testing results
+all_validation_predictions <- bind_rows(all_validation_predictions)
+all_test_predictions <- bind_rows(all_test_predictions)
+```
+
+```{r visualise evaluation}
+save.image(file = "my_workspace.RData")
+#set clusters as factors
+all_validation_predictions$cluster_model <- factor(all_validation_predictions$cluster_model)
+all_test_predictions$cluster_model <- factor(all_test_predictions$cluster_model)
+
+# Named vector for custom labels
+variable_labels <- c(`1` = "1 year forecast", `2` = "2 year forecast")
+#####visualisation####
+# Training Metrics visualisation
+  all_validation_predictions %>%
+    ggplot(aes(x = cluster_model, y = mean))+
+    geom_bar(stat = "identity", fill = "skyblue", alpha = 0.7)+
+    geom_errorbar(aes(ymin = mean - 1.96*std_err, ymax = mean + 1.96*std_err), width = 0.3, color = "red3")+
+    theme(axis.text.x = element_text(angle = 45,hjust = 1))+
+    facet_grid(.metric ~ forecast_horizon , scales = "free",space = "fixed",axis.labels = 'margins',labeller = labeller(forecast_horizon = variable_labels)) +
+    labs( title = paste0(" LGA cluster-based model validation scores for training window of ",window_size,"\n across forecasting horizons." ),
+          x = "Cluster model number",
+          y = "mean validation score")+
+    theme(plot.title = element_text(size = 11))  # Change the title size 
+
+# Testing set Evaluation metrics  
+all_test_predictions %>%
+  group_by(forecast_horizon,cluster_model)%>%
+  metrics_test(truth = ev_prop,estimate = boost_pred)%>%
+ggplot(aes(x =cluster_model, y = .estimate))+
+  geom_bar(stat = "identity", fill = "skyblue", alpha = 0.7)+
+  theme(axis.text.x = element_text(angle = 45,hjust = 1))+
+  facet_grid(.metric ~ forecast_horizon , scales = "free",space = "fixed", axis.labels = 'margins', labeller = labeller(forecast_horizon = variable_labels))  +
+  labs( title = paste0("Evaluation of LGA cluster-based models on testing set for training window of ",window_size,"\n across forecasting horizons."),
+        x = "Cluster model",
+        y = "Evaluation score")+
+  theme(plot.title = element_text(size = 11))  # Change the title size
+
+all_test_predictions
+```
+
+### Performance of Model under sample data
+```{r prediction vs actual}
+
+all_test_predictions%>%
+  #left_join(lgas,by='lga_code') %>%
+  #filter(agg_pred < 25) %>%
+  ggplot(aes(x =ev_prop, y = 4.5*boost_pred))+
+  geom_point()+
+  geom_abline(slope = 1, intercept = 0, color = "red")+
+  facet_grid(cluster_model ~ forecast_horizon , scales = "free",space = "fixed", labeller = labeller(
+    cluster_model = c("1" = "LGA group 1", "2" = "LGA group 2", "3" = "LGA group 3"),
+    forecast_horizon = c("1" = "1 year forecast", "2" = "2 year forecast")))  +
+  labs(x = "True EV uptake",
+       y = "Predicted EV uptake.",
+       title = "Actual vs Predict BEV uptake for LGA groups  .")+
+  theme(plot.title = element_text(size = 13),
+        plot.caption = element_text(hjust = 0, size = 10))
+```
+```{r}
+save.image(file = "my_workspace.RData")
+```
+
+
+## Re-train on more recent data set
+1. Retrain 4 sequences up to last available year, 2023.
+2. Predict on 2021, 2022 and 2023 window for 2024 and 2025.
+```{r Prepare prediction data}
+panel_to_supervised_prediction <- function(X, window_size, time_invariant_cols) {
+  sequences_list <- list()
+    # Identify time-variant columns
+  time_variant_cols <- setdiff(names(X), c('lga_code', "year", time_invariant_cols))
+  
+  for (L in unique(X$lga_code)) {
+    LGA_data <- subset(X, lga_code == L)
+    LGA_data <- LGA_data[order(LGA_data$year), ]
+    
+    # Extract time-invariant features for this LGA
+    time_invariant_data <- unique(LGA_data[, time_invariant_cols, drop = FALSE])
+    #slice the last possible sequence of window size from LGA trajectories
+    seq <- LGA_data[(nrow(LGA_data)-window_size+1):nrow(LGA_data), time_variant_cols, drop = FALSE]
+    # Flatten the sequence to a single row
+    seq_vector <- as.vector(t(seq))
+    # Create the sequence as a data frame
+    seq_df <- as.data.frame(t(seq_vector))
+    # Rename columns for time-variant features
+    new_colnames <- unlist(lapply((window_size:1) - 1, function(w) paste0(time_variant_cols, ".t-", w)))
+    colnames(seq_df) <- new_colnames
+      # Add time-invariant features
+    for (col in time_invariant_cols) {
+      seq_df[[col]] <- time_invariant_data[[col]]
+    }
+    # Add sequence number
+    sequence_number <- 1
+    seq_df$sequence_number <- sequence_number
+    
+    sequences_list[[length(sequences_list) + 1]] <- seq_df
+  }
+  
+  prediction_df <- do.call(rbind, sequences_list)
+  
+  return(prediction_df)
+}
+```
+
+
+```{r Prepare dat to Predict on future outcomes}
+############ Train on Whole Data, Predict for 2024 and 2025 using 21 - 23 #############
+new_training <- Analysis_data
+# predictor outcome segregation
+# separate predictors and target variable
+X_train_new <- new_training %>% select(-ev_prop)
+y_train_new <- new_training%>% select(ev_prop)
+#Combine with Auxiliary Variables
+training_new_combined <- merge(X_train_new, Auxiliary_data[,c('lga_code','year',selected_Aux_var,'region')], by = c("lga_code","year"), all.x = TRUE)
+print(paste("dimensions of combined training data set 2: ", nrow(training_new_combined)," by ",ncol(training_new_combined)))
+# Assign Clusters
+# Assign clusters to the training data by merging
+training_new_combined <- merge(training_new_combined,lga_cluster_map,by = "lga_code")
+#Train Imputation model on whole Dataset
+m_imps <- 30
+training_new_combined_imputed <- 
+  mice(data = training_new_combined, m = m_imps, predictorMatrix = pred2, method = meth2, post = post2, maxit = maxit, seed = 42)
+# Further Cleaning of data 
+# correct zero imputation via interpolation/extrapolation methods
+with_progress({training_new_combined_imputed_list <- correct_mids_columns(training_new_combined_imputed, id_col, time_col, value_columns)})
+# Extract auxiliary variables from training and testing data sets
+training_new_imputed_list <- lapply(training_new_combined_imputed_list,remove_cols,remove_auxiliary)
+
+```
+```{r}
+save(training_new_imputed_list, y_train_new,file = "whole_data_prediction.RData")
+```
+
+
+
+```{r}
+# Load the workspace from the file "my_workspace.RData"
+load(file = "my_workspace.RData")
+```
+
+
+
+## Train  Forecast model with whole data and predict new outcome
+
+```{r}
+# Activate progressr handlers
+handlers("progress")
+future::plan("multisession", workers = future::availableCores()-5)
+options(future.wait.timeout = 600)
+#h2o.init()
+set.seed(3254)
+# Define parameters
+window_size <- 3
+horizons <- 1:2
+#loop through all cluster models
+cluster_nos <- 1:3
+all_validation_predictions <- list()
+all_test_predictions <- list()
+#define metrics
+metrics_test <- metric_set(smape, yardstick::rmse, yardstick::mae )
+
+i <- 1
+for (horizon in horizons){
+  # Preprocess Training data list
+  #number of datasets for test
+  n <- sample(1:m_imps, 1)
+  sample_training_new <- training_new_imputed_list[[n]]
+
+  seq_training_new <- panel_to_supervised(sample_training_new, y_train_new, window_size, horizon, ti_cols)
+  seq_future_prediction <- panel_to_supervised_prediction(sample_training_new, window_size, ti_cols)
+  
+  for (cluster_no in cluster_nos){
+    
+      # Filter for clusters
+    seq_training_new_filtered <- seq_training_new %>% 
+      filter(cluster == cluster_no) %>%
+      select(-cluster)
+    
+    # Filter for clusters
+    seq_future_prediction_filtered <- seq_future_prediction %>% 
+      filter(cluster == cluster_no) %>%
+      select(-cluster)
+    
+    #arrange by sequence number and transform variables in dataset 
+    seq_train <- seq_training_new_filtered %>% 
+      arrange(sequence_number) %>%
+      group_by(lga_code) %>%
+      mutate(weight = sequence_weights(sequence_number,0.8),
+             weight = hardhat::importance_weights(weight)) %>%
+      ungroup()%>%
+      mutate(ev_prop = log(ev_prop + ev_prop_shift),#Log transformation
+             across(starts_with("population_density"),~log(. + pop_dense_shift)),
+             across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift)))
+             
+    ##### initialise models and tuning grids
+    #Elstic Net linear model
+    elasticnet_spec2 <-
+      linear_reg(penalty =tune(),mixture = tune()) %>% # this is a mixture of both L1 and L2. 
+      set_mode("regression") %>% 
+      set_engine("glmnet")
+    
+    #elastic net tuning grid
+    enlinear_grid <- grid_random(
+      penalty(),
+      mixture(),
+      size = 300
+      )
+    # define time_series cross validation
+    time_series_folds <- time_series_cv(seq_train,
+                                        date_var = sequence_number,
+                                        initial = 1,
+                                        assess = 1,
+                                        cumulative = TRUE,
+                                        skip = 1)
+    #set plan
+    time_series_folds %>% tk_time_series_cv_plan()
+    
+    # initialise recipe and workflow
+    initial_model_recipe <- recipe(ev_prop~ ., data = seq_train) %>%
+      step_rm(sequence_number) %>%
+      update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+      step_dummy(all_nominal(), -all_outcomes()) %>%
+      step_interact(terms = ~log_distance_capital:starts_with('state'),keep_original_cols = FALSE) %>%
+      step_zv(all_predictors(),-all_outcomes()) %>%
+      step_normalize(all_predictors(), -all_outcomes()) %>%
+      step_intercept()
+    
+      # Linear model workflow
+    enlinear_workflow <- workflow() %>%
+      add_model(elasticnet_spec2) %>%
+      add_case_weights(weight) %>%
+      add_recipe(initial_model_recipe)
+    
+    # tuning results  
+    with_progress({enlinear_tune_results <- tune_grid(enlinear_workflow, resamples = time_series_folds, metrics = metrics_test,  grid = enlinear_grid)})
+    
+   # bayes_param_enlinear <- 
+    #  enlinear_workflow %>% 
+    #  extract_parameter_set_dials() 
+    
+    #optimise hyperparameters
+    #enlinear_bayes_results <- tune_bayes(enlinear_workflow,
+    #                                     resamples = time_series_folds,
+    #                                     param_info = bayes_param_enlinear,
+    #                                     initial = enlinear_tune_results, 
+    #                                     metrics = metrics_test,
+    #                                     iter = 4,
+    #                                     control = control_bayes(verbose = TRUE, verbose_iter = TRUE, no_improve = 3))
+    # select best model        
+    enlinear_best_params <- select_best(enlinear_tune_results,metric = "smape")
+    enlinear_final_wf <- finalize_workflow(enlinear_workflow, enlinear_best_params)
+    # Fit the linear model
+    fitted_linear_model <- fit(enlinear_final_wf, data = seq_train)
+    #predictions with linear model
+    y_lin_fit <- predict(fitted_linear_model, new_data = seq_train)
+    # Bind the truth target variable 'ev_prop' with the predictions
+    #lin_result <- bind_cols(.row=1:length(seq_train$ev_prop),ev_prop = seq_train$ev_prop,lin_pred = y_lin_fit$.pred)
+    
+    # Extract residuals and create weights based on residuals
+    seq_train2 <- seq_train %>%
+          bind_cols(y_lin_fit %>%
+                  rename(linear_pred = .pred)) %>%
+      mutate(residuals = ev_prop - linear_pred) %>%
+      select(-c("ev_prop","linear_pred"))
+    
+    #XGBoost model specification
+    xgb_spec2 <- boost_tree(trees = 350,
+                           mtry = tune(),
+                           min_n = tune(),
+                           tree_depth = tune(),
+                           learn_rate = tune(),
+                           loss_reduction = tune())%>%
+      set_mode("regression") %>%
+      set_engine("xgboost",  alpha = 0.3, lambda = 1)
+    
+    # Define a grid of tuning parameters for XgBoost
+    xgb_grid <- grid_random(
+      learn_rate(), 
+      tree_depth(range = c(5,10)),
+      mtry(range=c(5,20)),
+      min_n(),
+      loss_reduction(range = c(-6,-1)),
+      size = 350)  # Increase the size for a finer grid
+    
+    # define time_series cross validation
+    time_series_folds2 <- time_series_cv(seq_train2,
+                                        date_var = sequence_number,
+                                        initial = 1,
+                                        assess = 1,
+                                        cumulative = TRUE,
+                                        skip = 1)
+    #set plan
+    time_series_folds2 %>% tk_time_series_cv_plan()
+    # Define the recipe for training xgboost on residuals
+    residuals_recipe <- recipe(residuals ~ ., data = seq_train2) %>%
+      step_rm(sequence_number) %>%
+      update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+      step_dummy(all_nominal(), -all_outcomes()) %>%
+      step_interact(terms = ~log_distance_capital:starts_with('state'),keep_original_cols = FALSE) %>%
+      step_zv(all_predictors(),-all_outcomes()) 
+    
+    #create workflow for xgboost model
+    xgb_workflow <- 
+      workflow() %>%
+      add_model(xgb_spec2) %>%
+      add_case_weights(weight) %>%
+      add_recipe(residuals_recipe)
+    
+    # tuning results  
+    with_progress({xgb_tune_results <- tune_grid(xgb_workflow, resamples = time_series_folds2, metrics = metrics_test, grid = xgb_grid )})
+    
+    #get parameters to tune
+    #bayes_param_xgb <- xgb_workflow %>% 
+    #    extract_parameter_set_dials() %>% 
+    #    update(mtry = finalize(mtry(), seq_train2%>%select(-c("sequence_number",'lga_code'))))
+      
+    #xgb_bayes_results <- tune_bayes(xgb_workflow,
+    #                                resamples = time_series_folds2,
+    #                                param_info = bayes_param_xgb,
+    #                                initial = initial_xgb_tune_results,
+    #                                metrics = metrics_test,
+    #                                iter = 4,
+    #                                control = control_bayes(verbose = TRUE, verbose_iter = TRUE, no_improve = 3))
+    # select best model        
+    xgb_best_params <- select_best(xgb_tune_results,metric = "smape")
+    xgb_final_wf <- finalize_workflow(xgb_workflow, xgb_best_params)
+    #fit model to training set  
+    fitted_xgb_model <- fit(xgb_final_wf, data = seq_train2) 
+    #predictions with linear model
+    y_xgb_fit <- predict(fitted_xgb_model, new_data = seq_train2)
+    # fit resamples on xgboost learning the residuals for the set linear trend prediction
+    resample_results <- fit_resamples(xgb_final_wf, resamples = time_series_folds2, metrics = metrics_test, control = control_resamples(save_pred = TRUE))
+    # collect resampling predictions
+    fullmodel_fit_results <- resample_results %>%
+      collect_metrics() 
+    #collect model specifications in a list
+    model_specs2 <- list(
+      elasticnet = elasticnet_spec2,
+      xgboost = xgb_spec2
+      )
+    submodel_fits <- list(linear_model = fitted_linear_model,
+                            xgb_model = fitted_xgb_model)
+    # includer cluster model number
+    fullmodel_fit_results <- fullmodel_fit_results %>%
+      mutate(cluster_model = cluster_no,
+             forecast_horizon = horizon)
+    
+    all_validation_predictions[[i]] <- fullmodel_fit_results
+  
+    ###### Future Predictions #####
+    seq_predict <- seq_future_prediction_filtered
+    seq_predict <- seq_predict %>% 
+      mutate(
+             across(starts_with("population_density"),~log(. + pop_dense_shift)),
+             across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift)))
+        
+    #### Make predictions with sub-models###
+    # Generalised Linear model
+    fitted_linear_model <- submodel_fits$linear_model
+    trend_predictions <- predict(fitted_linear_model, new_data = seq_predict)
+    #xGBoost Residual model
+    fitted_xgb_model <- submodel_fits$xgb_model
+    residual_predictions <- predict(fitted_xgb_model, new_data = seq_predict)
+    #Boost the predictions by adding the y_preds
+    boosted_predictions <- bind_cols(trend_pred = trend_predictions$.pred, res_pred = residual_predictions$.pred) %>%
+      mutate(boost_pred = trend_pred + res_pred)
+    # combine with id and truth value  
+    predictions <- boosted_predictions %>%
+        bind_cols(seq_predict%>%select(lga_code)) %>%
+        mutate(boost_pred = exp(boost_pred) - ev_prop_shift)
+    
+    ##include cluster model number
+    predictions <-
+      predictions %>%
+    mutate(cluster_model = cluster_no,
+           forecast_horizon = horizon)
+    
+    all_test_predictions[[i]] <- predictions
+    i <- i + 1
+  }
+}
+#combine cluster model validation and testing results
+all_validation_predictions <- bind_rows(all_validation_predictions)
+all_test_predictions <- bind_rows(all_test_predictions)
+```
+
+
+
+
+##Training and Testing models under Multiple Imputation 
+### Tuning Boosted Hybrid forecast model
+```{r bayesian optimisation, echo=FALSE}
+# imputed data sets reframed to sequences
+#seq_train_list 
+#seq_test_list 
+
+seq_train_filtered <- filter_datasets(seq_train_list,cluster_no)
+
+tune_models <- function(datasets, model_specs2, initial_tunes){
+  #initialise progress bar
+  pb <- progressor(along = 1:(3*m_imps))
+  
+  all_results <- list()
+  all_models <- list()
+  for (i in 1:m_imps) {
+    ##### Step 1: Train a Elastic Net Linear Regression model on the overall trend
+    #get single train data set of sequences
+    seq_train <- data.frame(seq_train_filtered[[i]])
+    #arrange by sequence number and transform variables in dataset 
+    seq_train <- seq_train %>% 
+      arrange(sequence_number) %>% # transform variables in dataset
+      mutate(ev_prop = log(ev_prop + ev_prop_shift,10),
+         across(starts_with("population_density"),~log(. + pop_dense_shift,10)),
+         across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift,10)))
+    # initialise linear recipe and workflow
+    initial_model_recipe <- recipe(~ ., data = seq_train) %>%
+      step_rm(sequence_number) %>%
+      update_role(ev_prop, new_role = "outcome") %>%
+      update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+      step_dummy(all_nominal(), -all_outcomes()) %>%
+      step_zv(all_predictors(),-all_outcomes()) %>%
+      step_normalize(all_predictors(), -all_outcomes())
+    
+    # define time_series cross validation
+    time_series_folds1 <- time_series_cv(seq_train,
+                                    date_var = sequence_number,
+                                    initial = 1,
+                                    assess = 1,
+                                    cumulative = TRUE,
+                                    skip = 1)
+    #set plan
+    time_series_folds1 %>% tk_time_series_cv_plan()
+    
+    ### Define Linear model Workflow
+    model_name1 <- names(model_specs2)[1]
+    spec1 <- model_specs2[[1]]
+    initial_tune1 <- initial_tunes[[1]]
+    
+    # Linear model workflow
+    enlinear_workflow <- workflow() %>%
+      add_model(spec1) %>%
+      add_recipe(initial_model_recipe)
+    
+    #get parameters to tune
+    bayes_params1 <- enlinear_workflow %>% 
+      extract_parameter_set_dials() 
+      
+    # optimise model hyperparameters
+    tuned_results1 <- tune_bayes(enlinear_workflow,
+                         resamples = time_series_folds1,
+                         param_info = bayes_params1,
+                         initial = initial_tune1, 
+                         iter = 10,
+                         control = control_bayes(verbose = TRUE, verbose_iter = TRUE, no_improve = 5)) 
+    # select best model        
+    linear_best_params <- select_best(tuned_results1,metric = "rmse")
+    linear_final_wf <- finalize_workflow(enlinear_workflow, linear_best_params)
+    
+    # Fit the linear model
+    fitted_linear_model <- fit(linear_final_wf, data = seq_train)
+    
+    #predictions with linear model
+    y_lin_fit <- predict(fitted_linear_model, new_data = seq_train)
+    # Bind the truth target variable 'ev_prop' with the predictions
+    lin_result <- bind_cols(.row=1:length(seq_train$ev_prop),ev_prop = seq_train$ev_prop,lin_pred = y_lin_fit$.pred)
+    #increment progress
+    pb()
+    ####Step 2: Train the XGBoost on the residuals of the linear fit.
+    # Extract residuals
+    seq_train2 <- seq_train %>%
+      bind_cols(y_lin_fit %>%
+                  rename(linear_pred = .pred)) %>%
+      mutate(residuals = ev_prop - linear_pred) %>%
+      select(-linear_pred)
+    
+    ### Define Linear model Workflow
+    model_name2 <- names(model_specs2)[2]
+    spec2 <- model_specs2[[2]]
+    initial_tune2 <- initial_tunes[[2]]
+    
+    #define time_series cross validation
+    time_series_folds2 <- time_series_cv(seq_train2,
+                                    date_var = sequence_number,
+                                    initial = 1,
+                                    assess = 1,
+                                    cumulative = TRUE,
+                                    skip = 1)
+    #set plan
+    time_series_folds2 %>% tk_time_series_cv_plan()
+
+    # Define the recipe for training xgboost on residuals
+    residuals_recipe <- recipe(residuals ~ ., data = seq_train2) %>%
+      step_rm(sequence_number, ev_prop) %>%
+      update_role(lga_code, new_role = "id") %>% # Assign 'id' a role that excludes it from modeling
+      step_dummy(all_nominal(), -all_outcomes()) %>%
+      step_zv(all_predictors(),-all_outcomes()) 
+      
+    #create workflow for xgboost model
+    xgb_workflow <- 
+      workflow() %>%
+      add_model(spec2) %>%
+      add_recipe(residuals_recipe)
+    
+    #get parameters to tune
+    bayes_param_xgb <- xgb_workflow %>% 
+      extract_parameter_set_dials() %>% 
+      update(mtry = finalize(mtry(), seq_train2%>%select(-c("sequence_number","ev_prop"))))
+      
+    # optimise model hyperparameters
+    tuned_results2 <- tune_bayes(xgb_workflow,
+                         resamples = time_series_folds2,
+                         param_info = bayes_param_xgb,
+                         initial = initial_tune2, 
+                         iter = 8,
+                         control = control_bayes(verbose = TRUE, verbose_iter = TRUE, no_improve = 4)) 
+    # select best model        
+    xgb_best_params <- select_best(tuned_results2,metric = "rmse")
+    xgb_final_wf <- finalize_workflow(xgb_workflow, xgb_best_params)
+    #fit model to training set  
+    fitted_xgb_model <- fit(xgb_final_wf, data = seq_train2) 
+      
+    #predictions with linear model
+    y_xgb_fit <- predict(fitted_xgb_model, new_data = seq_train2)
+    # increment progress 
+    pb()
+    ###Step 3: evaluate training score under rolling validation
+    #collect models in a list for later prediction.
+    submodel_fits <- list(linear_model = fitted_linear_model,
+                        xgb_model = fitted_xgb_model,
+                        imp_num = i)
+    # fit resamples on xgboost learning the residuals for the set linear trend prediction
+    resample_results <- fit_resamples(xgb_final_wf, resamples = time_series_folds2, control = control_resamples(save_pred = TRUE))
+    
+    # collect resampling predictions
+    fullmodel_fit_predictions <- resample_results %>%
+        collect_predictions() %>%
+        mutate(imp = i)
+    
+    # Join y_lin_fit_df with fullmodel_fit_predictions on .row
+    combined_predictions <- fullmodel_fit_predictions %>%
+      left_join(lin_result, by = ".row")
+    
+    # Sum the linear and residual predictions together to get the boosted prediction
+    combined_predictions <- combined_predictions %>%
+      mutate(boosted_pred = lin_pred + .pred) %>%
+      select(-c("residuals","lin_pred",".pred"))
+    
+    #collect all rolling validation predictions for aggregation
+    all_results[[i]] <- combined_predictions  
+    
+    #collect all models across mids
+    all_models[[i]] <- submodel_fits
+    pb()
+  }
+  all_results <- bind_rows(all_results)
+  
+  # aggregate predictions at each row
+  agg_results <- all_results %>% group_by(id,.row) %>%
+    summarise(agg_boosted_pred = mean(10^(boosted_pred) - ev_prop_shift),
+              ev_prop = mean(10^(ev_prop) - ev_prop_shift),
+              .groups = 'drop')
+  
+  return(list(agg_results,all_models))
+}
+
+with_progress({aggregate_results_tunedmodels <- tune_models(seq_train_filtered, model_specs2, initial_tunes)})
+```
+
+
+
+# Compared tuned models
+rolling time-series validation results of tuned models are compared.
+```{r Evaluate tuned models}
+metrics_test <- metric_set(yardstick::rmse, yardstick::mae, smape)
+
+aggregate_result <- aggregate_results_tunedmodels[[1]]
+ 
+modelsresults <- aggregate_result %>%
+  group_by(id) %>%
+  metrics_test(truth = ev_prop,estimate = agg_boosted_pred) 
+modelsresults <-
+modelsresults %>% 
+group_by(.metric) %>%
+  summarise( mean_score = mean(.estimate),
+             std_score = sd(.estimate),
+             .groups = 'drop')
+g <- modelsresults %>%
+  ggplot(aes(x = "validation", y = mean_score))+
+  geom_bar(stat = "identity", fill = "skyblue", alpha = 0.7)+
+  geom_errorbar(aes(ymin = mean_score - std_score, ymax = mean_score + std_score), width = 0.3, color = "red3")+
+  theme(axis.text.x = element_text(angle = 45,hjust = 1))+
+  facet_wrap(vars(.metric ), scales = "free") +
+  labs( title = paste0("Evaluation of trained model for training window of ",window_size," and horizon of ", horizon," under rolling validation"),
+        x = "Candidate models",
+        y = "mean validation score")+
+  theme(plot.title = element_text(size = 11))  # Change the title size
+g 
+```
+
+
+```{r collate models}
+modelset <- aggregate_results_tunedmodels[[2]]
+modelsetinfo <- list(models = modelset,
+                     forecast_horizon = horizon,
+                     cluster_model = cluster_no)
+model_collection <- append(model_collection,list(modelsetinfo))
+save.image(file = "my_workspace.RData")
+```
+
+## Forming model predictions on testing data
+1. Predictions are formed for each MIDS model set for cluster and forecast horizon combination based on the testing set.
+2. The predictions are aggregated across the MIDS for each cluster/forecast horizon model.
+3. The aggregated predictions are evaluated against the truth values.
+```{r model predictions}
+horizon <- 1
+cluster_no <- 1
+# collect testing data
+with_progress({seq_data_lists <- reframe(imputed_X_train_list, imputed_X_test_list, y_train, y_test,window_size,horizon,ti_cols)})
+seq_test_list <- seq_data_lists[[2]]
+#Filtering based on cluster
+seq_test_filtered <- filter_datasets(seq_test_list,cluster_no)
+
+evaluate_models <- function(model_collection, test_data, cluster_no, horizon){
+  results_list <- list()
+  #loop through collections
+  for (model_set in model_collection){
+    # Identify the modelset as specified
+    if(model_set$cluster_model == cluster_no && model_set$forecast_horizon == horizon){
+      #Extract the modelset
+      submodel_fits_list <- model_set$models
+      all_predictions <- list()
+      #loop through each model and mid
+      for (i in 1:m_imps) {
+        # extract the correct model for each MID
+        sub_models <- submodel_fits_list[[i]]
+        #extract the corresponding test MIDS and order by sequence number and transform variables
+        seq_test <- data.frame(test_data[[i]])
+        seq_test <- seq_test %>% 
+          arrange(sequence_number) %>% # transform variables in dataset
+          mutate(ev_prop = log(ev_prop + ev_prop_shift,10),
+                 across(starts_with("population_density"),~log(. + pop_dense_shift,10)),
+                 across(starts_with("neighbourhood_eV_prop"),~log(. + ev_prop_shift,10)))
+        
+        #### make predictions with sub-models
+        # Generalised Linear model
+        fitted_linear_model <- sub_models$linear_model
+        trend_predictions <- predict(fitted_linear_model, new_data = seq_test)
+        #xGBoost Residual model
+        fitted_xgb_model <- sub_models$xgb_model
+        residual_predictions <- predict(fitted_xgb_model, new_data = seq_test)
+        #Boost the predictions by adding the y_preds
+        boosted_predictions <- bind_cols(trend_pred = trend_predictions$.pred, res_pred = residual_predictions$.pred) %>%
+          mutate(boost_pred = trend_pred + res_pred)
+        # combine with id and truth value  
+        predictions <- boosted_predictions %>%
+          bind_cols(seq_test%>%select(c("ev_prop","lga_code","sequence_number"))) %>%
+          mutate(imp = i)
+        #append predictions to the list
+        all_predictions[[i]] <- predictions
+      }
+      # combine all predictions
+      combined_predictions <- bind_rows(all_predictions)
+      agg_predictions <- combined_predictions %>%
+        group_by(lga_code,sequence_number) %>%
+        summarise(agg_pred = mean(10^(boost_pred)-ev_prop_shift),
+                  ev_prop = mean(10^(ev_prop)-ev_prop_shift),
+                  .groups = 'drop') %>%
+        ungroup()
+    }
+  }
+  return(list(agg_predictions,combined_predictions))
+}
+
+agg_predictions_combined <- evaluate_models(model_collection, seq_test_filtered, cluster_no, horizon)
+combined_pred <- agg_predictions_combined[[2]]
+model_results1 <- metrics_test(agg_predictions_combined[[1]],truth = ev_prop,estimate = agg_pred) 
+
+g <- model_results1 %>%
+ggplot(aes(x = "Evaluation Metrics", y = .estimate))+
+geom_bar(stat = "identity", fill = "skyblue", alpha = 0.7)+
+theme(axis.text.x = element_text(angle = 45,hjust = 1))+
+facet_wrap(vars(.metric ), scales = "free") +
+labs( title = paste0("Evaluation of trained model for training window of ",window_size," and horizon of ", horizon," under rolling validation"),
+      x = "Candidate models",
+      y = "mean validation score")+
+theme(plot.title = element_text(size = 11))  # Change the title size
+g
+```
+
+```{r}
+submodel_fits[1]
+```
+
+
